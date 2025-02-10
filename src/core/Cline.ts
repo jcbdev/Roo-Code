@@ -10,7 +10,7 @@ import * as path from "path"
 import { serializeError } from "serialize-error"
 import * as vscode from "vscode"
 import { ApiHandler, SingleCompletionHandler, buildApiHandler } from "../api"
-import { ApiStream } from "../api/transform/stream"
+import { ApiStream, ApiStreamChunk } from "../api/transform/stream"
 import { DiffViewProvider } from "../integrations/editor/DiffViewProvider"
 import { findToolName, formatContentBlockToMarkdown } from "../integrations/misc/export-markdown"
 import {
@@ -62,6 +62,7 @@ import { McpHub } from "../services/mcp/McpHub"
 import crypto from "crypto"
 import { insertGroups } from "./diff/insert-groups"
 import { EXPERIMENT_IDS, experiments as Experiments } from "../shared/experiments"
+import { TextBlockParam } from "@anthropic-ai/sdk/resources/messages.mjs"
 
 const cwd =
 	vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0) ?? path.join(os.homedir(), "Desktop") // may or may not exist but fs checking existence would immediately ask for permission which would be bad UX, need to come up with a better solution
@@ -794,6 +795,79 @@ export class Cline {
 		}
 	}
 
+	async *continuationApiRequest(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+		let hiddenMessages: Anthropic.Messages.MessageParam[] = [...messages]
+		let currentAgentResponse: Anthropic.Messages.MessageParam
+		let requiresContinuation = true
+		const fauxUsage: ApiStreamChunk = {
+			type: "usage",
+			inputTokens: 0,
+			outputTokens: 0,
+		}
+		while (requiresContinuation) {
+			requiresContinuation = false
+			// Create a message so it can be reused for the continuation
+			currentAgentResponse = {
+				role: "assistant",
+				content: "",
+			}
+			const stream = this.api.createMessage(systemPrompt, hiddenMessages)
+			//wrap stream in a generator to allow for async iteration
+			const iterator = stream[Symbol.asyncIterator]()
+			let next = await iterator.next()
+			while (!requiresContinuation && !next.done) {
+				switch (next.value.type) {
+					case "text":
+						console.log("continuationApiRequest: text:", next.value.text)
+						currentAgentResponse.content += next.value.text
+						yield next.value
+						break
+					case "usage":
+						fauxUsage.inputTokens += next.value.inputTokens
+						fauxUsage.outputTokens += next.value.outputTokens
+						if (next.value.totalCost) {
+							fauxUsage.totalCost = (fauxUsage.totalCost || 0) + next.value.totalCost
+						}
+						if (next.value.cacheReadTokens) {
+							fauxUsage.cacheReadTokens = (fauxUsage.cacheReadTokens || 0) + next.value.cacheReadTokens
+						}
+						if (next.value.cacheWriteTokens) {
+							fauxUsage.cacheWriteTokens = (fauxUsage.cacheWriteTokens || 0) + next.value.cacheWriteTokens
+						}
+						if (next.value.stopReason) {
+							if (next.value.stopReason === "max_tokens" || next.value.stopReason === "length") {
+								console.log(
+									"continuationApiRequest: retrying due to stopReason:",
+									next.value.stopReason,
+								)
+								requiresContinuation = true
+								break
+							} else {
+								fauxUsage.stopReason = next.value.stopReason
+							}
+						}
+						console.log("continuationApiRequest: usage:", fauxUsage)
+						yield fauxUsage
+						break
+					default:
+						console.log("continuationApiRequest: default:", next.value)
+						yield next.value
+						break
+				}
+				next = await iterator.next()
+			}
+			if (requiresContinuation) {
+				console.log("continuationApiRequest: creating continuation message")
+				hiddenMessages.push(currentAgentResponse)
+				hiddenMessages.push({
+					role: "user",
+					content:
+						"Your response was too long and was truncated. Please continue your previous response from the exact same spot as if you were not interrupted.",
+				})
+			}
+		}
+	}
+
 	async *attemptApiRequest(previousApiReqIndex: number, retryAttempt: number = 0): ApiStream {
 		let mcpHub: McpHub | undefined
 
@@ -922,7 +996,7 @@ export class Cline {
 			}
 			return { role, content }
 		})
-		const stream = this.api.createMessage(systemPrompt, cleanConversationHistory)
+		const stream = this.continuationApiRequest(systemPrompt, cleanConversationHistory)
 		const iterator = stream[Symbol.asyncIterator]()
 
 		try {

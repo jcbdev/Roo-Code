@@ -122,15 +122,15 @@ export class AnthropicHandler implements ApiHandler, SingleCompletionHandler {
 					break
 				case "message_delta":
 					// tells us stop_reason, stop_sequence, and output tokens along the way and at the end of the message
-
 					yield {
 						type: "usage",
 						inputTokens: 0,
 						outputTokens: chunk.usage.output_tokens || 0,
+						stopReason: chunk.delta.stop_reason ?? undefined,
 					}
 					break
 				case "message_stop":
-					// no usage data, just an indicator that the message is done
+					// no usage data, just an indicator that the message is done§
 					break
 				case "content_block_start":
 					switch (chunk.content_block.type) {
